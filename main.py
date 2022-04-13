@@ -6,6 +6,7 @@ import random
 import argparse
 import numpy as np
 
+from torch.utils.data import DataLoader, random_split
 from torch.utils import data
 from datasets import VOCSegmentation, Cityscapes
 from utils import ext_transforms as et
@@ -91,12 +92,19 @@ def get_argparser():
                         help='port for visdom')
     parser.add_argument("--vis_env", type=str, default='main',
                         help='env for visdom')
-    parser.add_argument("--vis_num_samples", type=int, default=8,
+    parser.add_argument("--vis_num_samples", type=int, default=8, 
                         help='number of samples for visualization (default: 8)')
+    
+    # Unsupervised learning
+    parser.add_argument("--unsup", type=bool, default=False,
+                        help = 'enable unsupervised learning')
+    parser.add_argument("--ratio", type=float, default=None,
+                        help = "split supervised/unsupervised training set")
+
     return parser
 
 
-def get_dataset(opts):
+def get_dataset(opts, unsup=False):
     """ Dataset And Augmentation
     """
     if opts.dataset == 'voc':
@@ -124,7 +132,7 @@ def get_dataset(opts):
                                 std=[0.229, 0.224, 0.225]),
             ])
         train_dst = VOCSegmentation(root=opts.data_root, year=opts.year,
-                                    image_set='train', download=opts.download, transform=train_transform)
+                                    image_set='train', download=opts.download, transform=train_transform, unsup=unsup)
         val_dst = VOCSegmentation(root=opts.data_root, year=opts.year,
                                   image_set='val', download=False, transform=val_transform)
 
@@ -206,10 +214,22 @@ def validate(opts, model, loader, device, metrics, ret_samples_ids=None):
 
         score = metrics.get_results()
     return score, ret_samples
+def split_sup_unsup(trainset, ratio = 1/2):
+    # Split the indices in a stratified way
 
+    train_sup = int(ratio * len(trainset))
+    train_unsup = len(trainset) - train_sup
+    # val_sup = int(ratio * len(valset))
+    # val_unsup = len(valset) - val_sup
+   
+    sup_train, unsup_train = random_split(trainset,[train_sup, train_unsup] )
+    # sup_val, unsup_val = random_split(valset,[val_sup, val_unsup])
+
+    return sup_train, unsup_train
 
 def main():
     opts = get_argparser().parse_args()
+
     if opts.dataset.lower() == 'voc':
         opts.num_classes = 21
     elif opts.dataset.lower() == 'cityscapes':
@@ -234,17 +254,31 @@ def main():
     if opts.dataset == 'voc' and not opts.crop_val:
         opts.val_batch_size = 1
 
-    train_dst, val_dst = get_dataset(opts)
-    train_loader = data.DataLoader(
-        train_dst, batch_size=opts.batch_size, shuffle=True, num_workers=2,
-        drop_last=True)  # drop_last=True to ignore single-image batches.
-    val_loader = data.DataLoader(
-        val_dst, batch_size=opts.val_batch_size, shuffle=True, num_workers=2)
-    print("Dataset: %s, Train set: %d, Val set: %d" %
-          (opts.dataset, len(train_dst), len(val_dst)))
+    if opts.unsup:
+        train_dst, val_dst = get_dataset(opts, opts.unsup)
+        train_sup, train_unsup = split_sup_unsup(train_dst, ratio=opts.ratio)
+        train_loader = data.DataLoader(
+            train_unsup, batch_size=opts.batch_size, shuffle=True, num_workers=2,
+            drop_last=True)  # drop_last=True to ignore single-image batches.
+        val_loader = data.DataLoader(
+            val_dst, batch_size=opts.val_batch_size, shuffle=True, num_workers=2)
+        print("Dataset: %s, Train set: %d, Val set: %d" %
+            (opts.dataset, len(train_sup), len(val_dst)))
+        model = torch.load("checkpoints/best_deeplabv3plus_resnet50_voc_os16_%f" % opts.ratio)
+    else:
+        train_dst, val_dst = get_dataset(opts)
+        train_sup, train_unsup = split_sup_unsup(train_dst, ratio=opts.ratio)
 
+        train_loader = data.DataLoader(
+            train_sup, batch_size=opts.batch_size, shuffle=True, num_workers=2,
+            drop_last=True)  # drop_last=True to ignore single-image batches.
+        val_loader = data.DataLoader(
+            val_dst, batch_size=opts.val_batch_size, shuffle=True, num_workers=2)
+        print("Dataset: %s, Train set: %d, Val set: %d" %
+            (opts.dataset, len(train_sup), len(val_dst)))
     # Set up model (all models are 'constructed at network.modeling)
-    model = network.modeling.__dict__[opts.model](num_classes=opts.num_classes, output_stride=opts.output_stride)
+        model = network.modeling.__dict__[opts.model](num_classes=opts.num_classes, output_stride=opts.output_stride)
+
     if opts.separable_conv and 'plus' in opts.model:
         network.convert_to_separable_conv(model.classifier)
     utils.set_bn_momentum(model.backbone, momentum=0.01)
@@ -320,19 +354,34 @@ def main():
         return
 
     interval_loss = 0
+    lda = 2
     while True:  # cur_itrs < opts.total_itrs:
         # =====  Train  =====
         model.train()
         cur_epochs += 1
-        for (images, labels) in train_loader:
+        for (images, labels, weak, strong) in train_loader:
             cur_itrs += 1
 
             images = images.to(device, dtype=torch.float32)
             labels = labels.to(device, dtype=torch.long)
+            ###
+            # Unsupervised learning
 
+            weak = weak.to(device)
+            strong = strong.to(device)
+
+            weak_out = model(weak)
+            strong_out = model(strong)
+
+            pred_conf, pred_weak = torch.max(weak_out, dim = 1)
+            pred_weak[pred_conf < 0.8] = 255
+
+            unsup_loss = criterion(pred_weak, strong_out)    
+
+            ###
             optimizer.zero_grad()
             outputs = model(images)
-            loss = criterion(outputs, labels)
+            loss = criterion(outputs, labels) + lda * unsup_loss
             loss.backward()
             optimizer.step()
 
@@ -358,8 +407,8 @@ def main():
                 print(metrics.to_str(val_score))
                 if val_score['Mean IoU'] > best_score:  # save best model
                     best_score = val_score['Mean IoU']
-                    save_ckpt('checkpoints/best_%s_%s_os%d.pth' %
-                              (opts.model, opts.dataset, opts.output_stride))
+                    save_ckpt('checkpoints/best_%s_%s_os%d_%f.pth' %
+                              (opts.model, opts.dataset, opts.output_stride, opts.ratio))
 
                 if vis is not None:  # visualize validation score and samples
                     vis.vis_scalar("[Val] Overall Acc", cur_itrs, val_score['Overall Acc'])

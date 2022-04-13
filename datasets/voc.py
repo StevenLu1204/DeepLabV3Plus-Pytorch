@@ -8,6 +8,13 @@ import numpy as np
 
 from PIL import Image
 from torchvision.datasets.utils import download_url, check_integrity
+from albumentations import (
+    Compose,
+    HorizontalFlip,
+    GaussianBlur,
+    ColorJitter,
+    Cutout
+)
 
 DATASET_YEAR_DICT = {
     '2012': {
@@ -87,7 +94,8 @@ class VOCSegmentation(data.Dataset):
                  year='2012',
                  image_set='train',
                  download=False,
-                 transform=None):
+                 transform=None,
+                 unsup=False):
 
         is_aug=False
         if year=='2012_aug':
@@ -100,7 +108,8 @@ class VOCSegmentation(data.Dataset):
         self.filename = DATASET_YEAR_DICT[year]['filename']
         self.md5 = DATASET_YEAR_DICT[year]['md5']
         self.transform = transform
-        
+        self.unsup = unsup
+
         self.image_set = image_set
         base_dir = DATASET_YEAR_DICT[year]['base_dir']
         voc_root = os.path.join(self.root, base_dir)
@@ -143,6 +152,13 @@ class VOCSegmentation(data.Dataset):
         """
         img = Image.open(self.images[index]).convert('RGB')
         target = Image.open(self.masks[index])
+
+        if self.unsup:
+            weak, _ = self.weak_aug(img, target)
+            strong = self.strong_aug(weak)
+
+            return img, target, weak, strong
+
         if self.transform is not None:
             img, target = self.transform(img, target)
 
@@ -156,8 +172,28 @@ class VOCSegmentation(data.Dataset):
     def decode_target(cls, mask):
         """decode semantic mask to RGB image"""
         return cls.cmap[mask]
+    @classmethod
+    def weak_aug(cls, img, mask):
+        aug = Compose([
+            HorizontalFlip(p=0.5),
+        ])
+        auged = aug(image=img, mask=mask)
+        return auged['image'], auged['mask']
+    
+    @classmethod
+    def strong_aug(cls, img):
+        aug = Compose([  
+            ColorJitter(brightness=.2, contrast=.2, hue=.2, p=0.5),
+            Cutout(1, 50, 50, fill_value=255, p=0.5),
+            GaussianBlur(p=0.5)
+        ])
+
+        auged = aug(image=img)
+        return auged['image']
+        
 
 def download_extract(url, root, filename, md5):
     download_url(url, root, filename, md5)
     with tarfile.open(os.path.join(root, filename), "r") as tar:
         tar.extractall(path=root)
+
